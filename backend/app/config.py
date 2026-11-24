@@ -31,7 +31,7 @@ class Settings(BaseSettings):
         description="Enable X-Simulate-Failure header"
     )
     LLM_MODEL: str = Field(
-        default="gemini/gemini-3.8-flash",
+        default="gemini/gemini-3.6-flash",
         description="LiteLLM model name to use"
     )
     DEFAULT_SYSTEM_PROMPT: str = Field(
