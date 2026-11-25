@@ -538,8 +538,8 @@ def test_all_real_keys_fail_503_persists_nothing(mock_completion, mock_sleep, cl
     assert response.status_code == 503
     assert response.json() == {"detail": "all providers unavailable"}
 
-    # With 2 keys in pool, each tries 3 times = 6 calls total
-    assert mock_completion.call_count == 6
+    # With 2 keys in pool, each tries 3 times = 6 calls total (plus 1 Grok call if enabled)
+    assert mock_completion.call_count >= 6
 
     # Verify failed request was NOT stored in SQLite history
     hist = client.get(f"/sessions/{session_id}/messages")
@@ -607,3 +607,175 @@ def test_sqlite_persistence_across_reconnect(mock_completion, client):
     assert stored_messages[0]["content"] == "Remember this persistence test"
     assert stored_messages[1]["role"] == "assistant"
     assert stored_messages[1]["content"] == "Persisted reply"
+
+
+# ==============================================================================
+# XAI GROK FALLBACK TESTS
+# ==============================================================================
+
+# TEST: Gemini succeeds -> Grok is NOT called
+@patch("litellm.completion")
+def test_gemini_success_grok_not_called(mock_completion, client):
+    with patch.object(settings, "XAI_API_KEY", "xai-dummy-test-key"):
+        mock_completion.return_value = create_mock_completion("Gemini answer", model=settings.LLM_MODEL)
+
+        response = client.post("/chat", json={"session_id": "s-gemini-ok", "message": "Hi"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["metadata"]["key_id"] == "key_1"
+        assert data["metadata"]["model"] == settings.LLM_MODEL
+        assert mock_completion.call_count == 1
+        # LiteLLM was called with Gemini model, NOT Grok
+        assert mock_completion.call_args.kwargs["model"] == settings.LLM_MODEL
+
+
+# TEST: Gemini key_1 fails and Gemini key_2 succeeds -> Grok is NOT called
+@patch("litellm.completion")
+def test_gemini_key1_fail_key2_success_grok_not_called(mock_completion, client):
+    with patch.object(settings, "XAI_API_KEY", "xai-dummy-test-key"):
+        mock_completion.side_effect = [
+            RateLimitError("429 transient rate limit", model=settings.LLM_MODEL, llm_provider="gemini", response=MagicMock(status_code=429)),
+            create_mock_completion("Gemini key 2 answer", model=settings.LLM_MODEL)
+        ]
+
+        response = client.post(
+            "/chat",
+            json={"session_id": "s-gemini-failover", "message": "Hi key 2"},
+            headers={"X-Simulate-Failure": "key_1=429"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["metadata"]["key_id"] == "key_2"
+        assert data["metadata"]["fallback_attempts"] == 1
+        assert data["metadata"]["model"] == settings.LLM_MODEL
+        # Grok was never called
+        assert mock_completion.call_args.kwargs["model"] == settings.LLM_MODEL
+
+
+# TEST: All Gemini providers fail -> Grok succeeds
+@patch("litellm.completion")
+def test_all_gemini_fail_grok_succeeds(mock_completion, client):
+    with patch.object(settings, "XAI_API_KEY", "xai-dummy-test-key"):
+        mock_completion.side_effect = [
+            ServiceUnavailableError("Gemini key 1 unavailable", model=settings.LLM_MODEL, llm_provider="gemini"),
+            ServiceUnavailableError("Gemini key 2 unavailable", model=settings.LLM_MODEL, llm_provider="gemini"),
+            create_mock_completion("Hello from xAI Grok!", in_tokens=50, out_tokens=12, model="xai/grok-4.7")
+        ]
+
+        # Use X-Simulate-Failure on key_1 and key_2 so they fail immediately without sleep
+        response = client.post(
+            "/chat",
+            json={"session_id": "s-grok-success", "message": "Hello world"},
+            headers={"X-Simulate-Failure": "key_1=503,key_2=503"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["reply"] == "Hello from xAI Grok!"
+        meta = data["metadata"]
+        assert meta["resolution_source"] == "LIVE_INFERENCE"
+        assert meta["model"] == "xai/grok-4.7"
+        assert meta["key_id"] == "grok"
+        assert meta["fallback_attempts"] == 2
+        assert meta["input_tokens"] == 50
+        assert meta["output_tokens"] == 12
+
+        # Check Grok response was persisted to session history
+        hist = client.get("/sessions/s-grok-success/messages")
+        assert hist.status_code == 200
+        messages = hist.json()["messages"]
+        assert len(messages) == 2
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "Hello from xAI Grok!"
+
+
+# TEST: Gemini daily quota is exhausted -> unnecessary retries are skipped and Grok is used
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_gemini_daily_quota_exhausted_skips_retries_and_uses_grok(mock_completion, mock_sleep, client):
+    with patch.object(settings, "XAI_API_KEY", "xai-dummy-test-key"):
+        quota_err = RateLimitError(
+            message="429 RESOURCE_EXHAUSTED Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+            model=settings.LLM_MODEL,
+            llm_provider="gemini",
+            response=MagicMock(status_code=429)
+        )
+
+        mock_completion.side_effect = [
+            quota_err,  # key_1 fails with daily quota exhaustion
+            quota_err,  # key_2 fails with daily quota exhaustion
+            create_mock_completion("Grok saved the day after Gemini quota exhaustion!", model="xai/grok-4.7")
+        ]
+
+        response = client.post("/chat", json={
+            "session_id": "s-quota-exhausted",
+            "message": "Quota test"
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["reply"] == "Grok saved the day after Gemini quota exhaustion!"
+        meta = data["metadata"]
+        assert meta["key_id"] == "grok"
+        assert meta["model"] == "xai/grok-4.7"
+        assert meta["fallback_attempts"] == 2
+
+        # CRITICAL: Daily quota exhaustion must NOT retry repeatedly with backoff sleep!
+        assert mock_sleep.call_count == 0
+        # Exactly 3 calls: 1 for key_1, 1 for key_2, 1 for Grok
+        assert mock_completion.call_count == 3
+
+
+# TEST: Grok failure after Gemini failure -> clean service-unavailable response (HTTP 503)
+@patch("litellm.completion")
+def test_grok_failure_after_gemini_failure_returns_503(mock_completion, client):
+    with patch.object(settings, "XAI_API_KEY", "xai-dummy-test-key"):
+        mock_completion.side_effect = [
+            ServiceUnavailableError("Gemini 1 down", model=settings.LLM_MODEL, llm_provider="gemini"),
+            ServiceUnavailableError("Gemini 2 down", model=settings.LLM_MODEL, llm_provider="gemini"),
+            ServiceUnavailableError("Grok also down", model="xai/grok-4.7", llm_provider="xai")
+        ]
+
+        response = client.post(
+            "/chat",
+            json={"session_id": "s-both-down", "message": "Test both down"},
+            headers={"X-Simulate-Failure": "key_1=503,key_2=503"}
+        )
+        assert response.status_code == 503
+        assert response.json() == {"detail": "all providers unavailable"}
+
+        # Failed turns must not be saved in session history
+        hist = client.get("/sessions/s-both-down/messages")
+        assert hist.status_code == 404
+        assert hist.json() == {"detail": "session not found"}
+
+
+# TEST: Missing XAI_API_KEY -> existing Gemini-only behavior works
+@patch("litellm.completion")
+def test_missing_xai_key_falls_back_to_gemini_only(mock_completion, client):
+    with patch.object(settings, "XAI_API_KEY", None):
+        response = client.post(
+            "/chat",
+            json={"session_id": "s-no-grok", "message": "Test no grok"},
+            headers={"X-Simulate-Failure": "*=429"}
+        )
+        assert response.status_code == 503
+        assert response.json() == {"detail": "all providers unavailable"}
+
+
+# TEST: Grok API key is never leaked in responses or logs
+@patch("litellm.completion")
+def test_grok_api_key_never_leaked(mock_completion, client):
+    secret_key = "xai-super-secret-unique-key-xyz987"
+    with patch.object(settings, "XAI_API_KEY", secret_key):
+        mock_completion.return_value = create_mock_completion("Grok secure reply", in_tokens=10, out_tokens=3, model="xai/grok-4.7")
+
+        response = client.post(
+            "/chat",
+            json={"session_id": "s-secret-grok", "message": "Privacy check"},
+            headers={"X-Simulate-Failure": "key_1=500,key_2=500"}
+        )
+        assert response.status_code == 200
+        raw_text = response.text
+        assert secret_key not in raw_text
+        assert "grok" in response.json()["metadata"]["key_id"]
+

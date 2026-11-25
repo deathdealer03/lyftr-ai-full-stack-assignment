@@ -17,6 +17,8 @@ services:
       - LLM_MODEL=${LLM_MODEL:-gemini/gemini-3.8-flash}
       - CACHE_TYPE=${CACHE_TYPE:-local}
       - LLM_REQUEST_TIMEOUT=${LLM_REQUEST_TIMEOUT:-20.0}
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - XAI_MODEL=${XAI_MODEL:-xai/grok-4.7}
     volumes:
       - sqlite_data:/data
     healthcheck:

@@ -42,6 +42,8 @@ async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized. Ready to accept requests.")
     logger.info("Loaded %d Gemini API keys", len(settings.key_pool))
+    if settings.has_grok:
+        logger.info("Grok fallback configured")
     yield
 
 

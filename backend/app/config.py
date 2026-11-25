@@ -1,6 +1,6 @@
 import os
 import re
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -47,6 +47,32 @@ class Settings(BaseSettings):
         default=20.0,
         description="Per-request timeout in seconds for LiteLLM completion calls"
     )
+    XAI_API_KEY: Optional[str] = Field(
+        default=None,
+        description="xAI Grok API key for fallback provider"
+    )
+    XAI_MODEL: str = Field(
+        default="xai/grok-4.7",
+        description="xAI Grok model identifier"
+    )
+
+    @property
+    def has_grok(self) -> bool:
+        return bool(self.cleaned_xai_api_key)
+
+    @property
+    def cleaned_xai_api_key(self) -> Optional[str]:
+        if not self.XAI_API_KEY:
+            return None
+        k = self.XAI_API_KEY.strip().strip("'\"").strip()
+        return k if k else None
+
+    @property
+    def normalized_xai_model(self) -> str:
+        raw = self.XAI_MODEL.strip().strip("'\"")
+        if not raw.startswith("xai/"):
+            return f"xai/{raw}"
+        return raw
 
     @property
     def normalized_model(self) -> str:
