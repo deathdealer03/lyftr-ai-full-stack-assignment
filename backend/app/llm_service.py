@@ -266,11 +266,6 @@ class LLMService:
                 logger.info("Simulating failure on %s with status %s (no retry)", key_id, simulated_code)
                 fallback_attempts += 1
                 last_error = f"Simulated error {simulated_code}"
-                # Consume a mock completion call to keep side_effect ordering
-                try:
-                    _ = await asyncio.to_thread(litellm.completion, model=self.model, messages=messages, api_key=actual_key, timeout=self.timeout)
-                except Exception:
-                    pass
                 continue
 
             logger.info("Trying provider %s", key_id)
@@ -381,74 +376,7 @@ class LLMService:
             if not key_succeeded:
                 fallback_attempts += 1
 
-        # 3. xAI Grok Fallback Provider
-        # If all configured Gemini keys failed or are unavailable, fall back to Grok if configured
-        if settings.has_grok:
-            simulated_grok = None
-            if "*" in sim_map:
-                simulated_grok = sim_map["*"]
-            elif "grok" in sim_map:
-                simulated_grok = sim_map["grok"]
-
-            if simulated_grok is not None:
-                logger.info("Simulating failure on Grok with status %s (no retry)", simulated_grok)
-                fallback_attempts += 1
-                last_error = f"Simulated error {simulated_grok}"
-            else:
-                logger.info("Falling back to xAI Grok provider (%s)", settings.normalized_xai_model)
-                try:
-                    grok_kwargs = {
-                        "model": settings.normalized_xai_model,
-                        "messages": messages,
-                        "api_key": settings.cleaned_xai_api_key,
-                        "timeout": self.timeout,
-                    }
-
-                    response = await asyncio.to_thread(litellm.completion, **grok_kwargs)
-                    reply_text = response.choices[0].message.content or ""
-
-                    if hasattr(response, "usage") and response.usage:
-                        input_tokens = getattr(response.usage, "prompt_tokens", None)
-                        output_tokens = getattr(response.usage, "completion_tokens", None)
-                        if input_tokens is None or output_tokens is None:
-                            calc_in, calc_out = calculate_tokens(settings.normalized_xai_model, messages, reply_text)
-                            input_tokens = input_tokens if input_tokens is not None else calc_in
-                            output_tokens = output_tokens if output_tokens is not None else calc_out
-                    else:
-                        input_tokens, output_tokens = calculate_tokens(settings.normalized_xai_model, messages, reply_text)
-
-                    latency_ms = int((time.perf_counter() - start_time) * 1000)
-                    latency_ms = max(1, latency_ms)
-
-                    # Store into LiteLLM cache
-                    cache_payload = {
-                        "reply": reply_text,
-                        "input_tokens": int(input_tokens),
-                        "output_tokens": int(output_tokens),
-                        "model": settings.normalized_xai_model
-                    }
-                    if hasattr(litellm.cache, "cache"):
-                        litellm.cache.cache.set_cache(
-                            cache_key,
-                            {"timestamp": time.time(), "response": cache_payload}
-                        )
-
-                    return {
-                        "reply": reply_text,
-                        "resolution_source": "LIVE_INFERENCE",
-                        "model": settings.normalized_xai_model,
-                        "latency_ms": latency_ms,
-                        "input_tokens": int(input_tokens),
-                        "output_tokens": int(output_tokens),
-                        "key_id": "grok",
-                        "fallback_attempts": fallback_attempts
-                    }
-                except Exception as e:
-                    last_error = str(e)
-                    fallback_attempts += 1
-                    logger.error("Grok fallback failed: %s", str(e))
-
-        # If every provider (Gemini + Grok) failed
+        # If all Gemini providers failed
         logger.error("All providers failed after %s fallback attempts. Last error: %s", fallback_attempts, last_error)
         raise HTTPException(status_code=503, detail="all providers unavailable")
 
