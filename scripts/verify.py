@@ -29,7 +29,7 @@ init_db()
 
 client = TestClient(app)
 
-def mock_llm_response(content="The capital of France is Paris.", in_tokens=42, out_tokens=9, model="gemini/gemini-2.0-flash"):
+def mock_llm_response(content="The capital of France is Paris.", in_tokens=42, out_tokens=9, model="gemini/gemini-3.8-flash"):
     return ModelResponse(
         id="cmpl-eval-mock",
         choices=[Choices(finish_reason="stop", index=0, message=Message(content=content, role="assistant"))],

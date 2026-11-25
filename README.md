@@ -190,7 +190,7 @@ curl -X POST http://localhost:8000/chat \
   "reply": "The capital of France is Paris.",
   "metadata": {
     "resolution_source": "LIVE_INFERENCE",
-    "model": "gemini/gemini-2.0-flash",
+    "model": "gemini/gemini-3.8-flash",
     "latency_ms": 780,
     "input_tokens": 42,
     "output_tokens": 9,
@@ -219,7 +219,7 @@ curl -X POST http://localhost:8000/chat \
   "reply": "The capital of France is Paris.",
   "metadata": {
     "resolution_source": "LLM_CACHE",
-    "model": "gemini/gemini-2.0-flash",
+    "model": "gemini/gemini-3.8-flash",
     "latency_ms": 2,
     "input_tokens": 42,
     "output_tokens": 9,
@@ -250,7 +250,7 @@ curl -X POST http://localhost:8000/chat \
   "reply": "Why did the scarecrow win an award? Because he was outstanding in his field!",
   "metadata": {
     "resolution_source": "LIVE_INFERENCE",
-    "model": "gemini/gemini-2.0-flash",
+    "model": "gemini/gemini-3.8-flash",
     "latency_ms": 810,
     "input_tokens": 38,
     "output_tokens": 16,
@@ -371,7 +371,7 @@ python scripts/verify.py
    - `DATABASE_URL`: `sqlite:///./data/app.db`
    - `ALLOWED_ORIGINS`: `https://your-frontend-domain.vercel.app`
    - `ENABLE_FAILURE_SIMULATION`: `true`
-   - `LLM_MODEL`: `gemini/gemini-2.0-flash`
+   - `LLM_MODEL`: `gemini/gemini-3.8-flash`
 
 ### 2. Frontend Deployment (Vercel / Netlify / Cloudflare Pages)
 1. Create a new project pointing to the `frontend/` directory.

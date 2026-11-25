@@ -1,4 +1,5 @@
 import os
+import re
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
         description="Enable X-Simulate-Failure header"
     )
     LLM_MODEL: str = Field(
-        default="gemini/gemini-2.5-flash",
+        default="gemini/gemini-3.8-flash",
         description="LiteLLM model name to use"
     )
     DEFAULT_SYSTEM_PROMPT: str = Field(
@@ -42,11 +43,43 @@ class Settings(BaseSettings):
         default="local",
         description="LiteLLM cache type: local or disk"
     )
+    LLM_REQUEST_TIMEOUT: float = Field(
+        default=20.0,
+        description="Per-request timeout in seconds for LiteLLM completion calls"
+    )
+
+    @property
+    def normalized_model(self) -> str:
+        """
+        Normalizes model string to ensure Google AI Studio (gemini) provider routing in LiteLLM.
+        If a user supplies 'gemini-3.8-flash' without 'gemini/', LiteLLM defaults to vertex_ai.
+        Prefixed with 'gemini/', LiteLLM correctly routes to Google AI Studio via Gemini API keys.
+        """
+        raw = self.LLM_MODEL.strip().strip("'\"")
+        if raw.startswith("gemini-") and not raw.startswith("gemini/"):
+            return f"gemini/{raw}"
+        return raw
 
     @property
     def key_list(self) -> List[str]:
-        keys = [k.strip() for k in self.LLM_API_KEYS.split(",") if k.strip()]
-        return keys
+        raw = self.LLM_API_KEYS
+        if not raw:
+            return []
+        raw = raw.strip()
+        # Strip enclosing single/double quotes around entire env value
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1].strip()
+
+        # Normalize line endings and delimiters (commas, newlines, semicolons)
+        normalized = raw.replace("\r\n", "\n").replace("\r", "\n").replace(";", ",")
+        tokens = re.split(r"[\n,]+", normalized)
+
+        cleaned: List[str] = []
+        for token in tokens:
+            k = token.strip().strip("'\"").strip()
+            if k:
+                cleaned.append(k)
+        return cleaned
 
     @property
     def key_pool(self) -> List[dict]:

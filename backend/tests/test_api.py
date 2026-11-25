@@ -1,7 +1,9 @@
 import json
-from unittest.mock import patch, MagicMock
+import asyncio
+from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 from litellm.types.utils import ModelResponse, Choices, Message, Usage
+from litellm.exceptions import ServiceUnavailableError, RateLimitError
 from app.config import settings
 
 
@@ -272,9 +274,10 @@ def test_history_endpoint(mock_completion, client):
     assert r_unknown.json() == {"detail": "session not found"}
 
 
-# TEST 8 — Failover 429
+# TEST 8 — Failover 429 (Simulated failure - NO retries, immediate failover)
+@patch("asyncio.sleep", new_callable=AsyncMock)
 @patch("litellm.completion")
-def test_failover_429(mock_completion, client):
+def test_failover_429(mock_completion, mock_sleep, client):
     mock_completion.return_value = create_mock_completion("Real answer from key 2", in_tokens=30, out_tokens=6)
 
     response = client.post(
@@ -289,11 +292,14 @@ def test_failover_429(mock_completion, client):
     assert meta["key_id"] == "key_2"
     assert meta["fallback_attempts"] == 1
     assert meta["resolution_source"] == "LIVE_INFERENCE"
+    # Simulated failure must NOT trigger any backoff sleeps
+    assert mock_sleep.call_count == 0
 
 
-# TEST 9 — Failover 500
+# TEST 9 — Failover 500 (Simulated failure - NO retries, immediate failover)
+@patch("asyncio.sleep", new_callable=AsyncMock)
 @patch("litellm.completion")
-def test_failover_500(mock_completion, client):
+def test_failover_500(mock_completion, mock_sleep, client):
     mock_completion.return_value = create_mock_completion("Real answer after 500", in_tokens=25, out_tokens=5)
 
     response = client.post(
@@ -306,11 +312,14 @@ def test_failover_500(mock_completion, client):
     meta = data["metadata"]
     assert meta["key_id"] == "key_2"
     assert meta["fallback_attempts"] == 1
+    # Simulated failure must NOT trigger any backoff sleeps
+    assert mock_sleep.call_count == 0
 
 
-# TEST 10 — Every key fails (503 and nothing in history)
+# TEST 10 — Every key fails (Simulated *=429 -> 503 and nothing in history)
+@patch("asyncio.sleep", new_callable=AsyncMock)
 @patch("litellm.completion")
-def test_all_keys_fail_503(mock_completion, client):
+def test_all_keys_fail_503(mock_completion, mock_sleep, client):
     session_id = "s-all-fail"
     response = client.post(
         "/chat",
@@ -319,8 +328,220 @@ def test_all_keys_fail_503(mock_completion, client):
     )
     assert response.status_code == 503
     assert response.json() == {"detail": "all providers unavailable"}
+    assert mock_sleep.call_count == 0
 
     # Verify nothing was added to history
+    hist = client.get(f"/sessions/{session_id}/messages")
+    assert hist.status_code == 404
+    assert hist.json() == {"detail": "session not found"}
+
+
+# NEW TEST: Real 503 error followed by success on same key after retry
+# TEST: Real 503 retry and recovery on same key with backoff + jitter
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_real_503_retry_and_success_on_same_key(mock_completion, mock_sleep, client):
+    """
+    Key 1 receives real 503 on attempt 1, retries after backoff+jitter, and succeeds on attempt 2.
+    fallback_attempts must remain 0 and key_id must be key_1.
+    """
+    mock_completion.side_effect = [
+        ServiceUnavailableError(
+            message="This model is currently experiencing high demand.",
+            model=settings.LLM_MODEL,
+            llm_provider="gemini"
+        ),
+        create_mock_completion("Recovered on same key", in_tokens=20, out_tokens=5)
+    ]
+
+    session_id = "s-real-503-recover"
+    response = client.post(
+        "/chat",
+        json={"session_id": session_id, "message": "Hello 503 retry"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["reply"] == "Recovered on same key"
+    meta = data["metadata"]
+    # Crucial requirement: retries of the SAME key must NOT count as fallback_attempts
+    assert meta["key_id"] == "key_1"
+    assert meta["fallback_attempts"] == 0
+    assert meta["resolution_source"] == "LIVE_INFERENCE"
+
+    # Verify completion called twice on key_1
+    assert mock_completion.call_count == 2
+    # Verify backoff sleep was called once with base 1.0s + jitter
+    assert mock_sleep.call_count == 1
+    assert 1.0 <= mock_sleep.call_args_list[0][0][0] <= 1.5
+
+
+# TEST: Repeated real 503 exhausts retries on key 1, then fails over to key 2
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_repeated_real_503_failover_to_next_key(mock_completion, mock_sleep, client):
+    """
+    Key 1 fails attempts 1, 2, and 3 with real 503.
+    Key 2 succeeds on attempt 1.
+    fallback_attempts must be 1 and key_id must be key_2.
+    """
+    mock_completion.side_effect = [
+        ServiceUnavailableError("503 Spike 1", model=settings.LLM_MODEL, llm_provider="gemini"),
+        ServiceUnavailableError("503 Spike 2", model=settings.LLM_MODEL, llm_provider="gemini"),
+        ServiceUnavailableError("503 Spike 3", model=settings.LLM_MODEL, llm_provider="gemini"),
+        create_mock_completion("Key 2 succeeded after key 1 gave up", in_tokens=25, out_tokens=8)
+    ]
+
+    session_id = "s-exhaust-key1"
+    response = client.post(
+        "/chat",
+        json={"session_id": session_id, "message": "Hello 503 failover"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["reply"] == "Key 2 succeeded after key 1 gave up"
+    meta = data["metadata"]
+    assert meta["key_id"] == "key_2"
+    assert meta["fallback_attempts"] == 1
+
+    # Key 1 had 3 attempts (initial + 2 retries), Key 2 had 1 attempt = 4 total
+    assert mock_completion.call_count == 4
+    # Key 1 slept twice: ~1.0s and ~2.0s with jitter
+    assert mock_sleep.call_count == 2
+    assert 1.0 <= mock_sleep.call_args_list[0][0][0] <= 1.5
+    assert 2.0 <= mock_sleep.call_args_list[1][0][0] <= 2.5
+
+
+# TEST: Temporary timeout retries with backoff and recovers on same key
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_real_timeout_retry_and_success_on_same_key(mock_completion, mock_sleep, client):
+    """
+    Key 1 hits temporary read timeout on attempt 1, retries and succeeds on attempt 2.
+    fallback_attempts remains 0 and key_id is key_1.
+    """
+    import litellm.exceptions
+    mock_completion.side_effect = [
+        litellm.exceptions.Timeout(
+            message="Read timed out. Timeout passed=20.0",
+            model=settings.LLM_MODEL,
+            llm_provider="gemini"
+        ),
+        create_mock_completion("Answer after timeout retry", in_tokens=15, out_tokens=5)
+    ]
+
+    session_id = "s-timeout-retry"
+    response = client.post(
+        "/chat",
+        json={"session_id": session_id, "message": "Hello timeout retry"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["reply"] == "Answer after timeout retry"
+    assert data["metadata"]["key_id"] == "key_1"
+    assert data["metadata"]["fallback_attempts"] == 0
+    assert mock_sleep.call_count == 1
+    assert 1.0 <= mock_sleep.call_args_list[0][0][0] <= 1.5
+    assert mock_completion.call_count == 2
+
+
+# TEST: Temporary 429 rate limit retries with backoff and recovers on same key
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_real_429_retry_and_success_on_same_key(mock_completion, mock_sleep, client):
+    """
+    Key 1 hits temporary 429 RateLimit on attempt 1, retries and succeeds on attempt 2.
+    fallback_attempts remains 0 and key_id is key_1.
+    """
+    mock_completion.side_effect = [
+        RateLimitError(
+            message="Resource exhausted / Rate limit spike",
+            model=settings.LLM_MODEL,
+            llm_provider="gemini",
+            response=MagicMock(status_code=429)
+        ),
+        create_mock_completion("Answer after 429 retry", in_tokens=18, out_tokens=6)
+    ]
+
+    session_id = "s-429-retry"
+    response = client.post(
+        "/chat",
+        json={"session_id": session_id, "message": "Hello 429 retry"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["reply"] == "Answer after 429 retry"
+    assert data["metadata"]["key_id"] == "key_1"
+    assert data["metadata"]["fallback_attempts"] == 0
+    assert mock_sleep.call_count == 1
+    assert 1.0 <= mock_sleep.call_args_list[0][0][0] <= 1.5
+    assert mock_completion.call_count == 2
+
+
+# TEST: Permanent AuthenticationError fails over immediately without retrying the same key
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_permanent_auth_error_fails_over_immediately_without_retry(mock_completion, mock_sleep, client):
+    """
+    Key 1 encounters permanent 401 AuthenticationError (invalid key).
+    Must NOT retry Key 1.
+    Must fail over immediately to Key 2.
+    """
+    import litellm.exceptions
+    mock_completion.side_effect = [
+        litellm.exceptions.AuthenticationError(
+            message="API key not valid. Please pass a valid API key.",
+            model=settings.LLM_MODEL,
+            llm_provider="gemini"
+        ),
+        create_mock_completion("Answer from key 2 after key 1 auth error", in_tokens=22, out_tokens=7)
+    ]
+
+    session_id = "s-auth-error-failover"
+    response = client.post(
+        "/chat",
+        json={"session_id": session_id, "message": "Test auth error failover"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["metadata"]["key_id"] == "key_2"
+    assert data["metadata"]["fallback_attempts"] == 1
+    # No backoff sleep on permanent auth error
+    assert mock_sleep.call_count == 0
+    assert mock_completion.call_count == 2
+
+
+# TEST: All real keys exhaust retries -> 503 and nothing in history
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("litellm.completion")
+def test_all_real_keys_fail_503_persists_nothing(mock_completion, mock_sleep, client):
+    """
+    Every key in the pool exhausts all 3 attempts with real 503.
+    Returns 503, nothing stored in history.
+    """
+    mock_completion.side_effect = ServiceUnavailableError(
+        "503 Permanent capacity issue",
+        model=settings.LLM_MODEL,
+        llm_provider="gemini"
+    )
+
+    session_id = "s-real-all-fail"
+    response = client.post(
+        "/chat",
+        json={"session_id": session_id, "message": "This should fail all keys with 503"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "all providers unavailable"}
+
+    # With 2 keys in pool, each tries 3 times = 6 calls total
+    assert mock_completion.call_count == 6
+
+    # Verify failed request was NOT stored in SQLite history
     hist = client.get(f"/sessions/{session_id}/messages")
     assert hist.status_code == 404
     assert hist.json() == {"detail": "session not found"}
@@ -386,4 +607,3 @@ def test_sqlite_persistence_across_reconnect(mock_completion, client):
     assert stored_messages[0]["content"] == "Remember this persistence test"
     assert stored_messages[1]["role"] == "assistant"
     assert stored_messages[1]["content"] == "Persisted reply"
-

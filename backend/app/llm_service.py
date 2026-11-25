@@ -1,5 +1,7 @@
 import os
 import time
+import random
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import HTTPException
@@ -16,6 +18,9 @@ from litellm.exceptions import (
     ServiceUnavailableError,
     InternalServerError,
     BadGatewayError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
 )
 
 from app.config import settings
@@ -23,6 +28,11 @@ from app.config import settings
 logger = logging.getLogger("backend.llm")
 litellm.telemetry = False
 litellm.suppress_debug_info = True
+
+# Exponential backoff schedule for temporary real-provider errors (per key)
+# attempt 1 -> wait 1.0s + jitter, attempt 2 -> wait 2.0s + jitter, attempt 3 -> fail over to next key
+BACKOFF_DELAYS: List[float] = [1.0, 2.0]
+MAX_ATTEMPTS_PER_KEY: int = 3
 
 # Initialize LiteLLM Cache
 cache_type = settings.CACHE_TYPE if settings.CACHE_TYPE in ("local", "disk") else "local"
@@ -33,6 +43,69 @@ litellm.enable_cache(type=cache_type)
 def is_cache_configured() -> bool:
     """Returns True if LiteLLM cache is configured."""
     return litellm.cache is not None
+
+
+def is_permanent_error(exc: Exception) -> bool:
+    """Identifies authentication, permission, or client errors that must not be retried."""
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError, NotFoundError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (400, 401, 403, 404):
+        return True
+    resp = getattr(exc, "response", None)
+    if resp and getattr(resp, "status_code", None) in (400, 401, 403, 404):
+        return True
+    return False
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    """
+    Identifies whether an exception represents a temporary, retryable error:
+    - HTTP 503 Service Unavailable / High demand
+    - HTTP 429 RateLimit / Quota spike
+    - Timeout / Read timed out
+    - HTTP 502 Bad Gateway / HTTP 504 Gateway Timeout
+    - APIConnectionError
+    """
+    if is_permanent_error(exc):
+        return False
+
+    if isinstance(exc, (ServiceUnavailableError, RateLimitError, litellm.exceptions.Timeout, APIConnectionError, BadGatewayError)):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (429, 502, 503, 504):
+        return True
+
+    resp = getattr(exc, "response", None)
+    if resp and getattr(resp, "status_code", None) in (429, 502, 503, 504):
+        return True
+
+    err_str = str(exc).lower()
+    retryable_keywords = [
+        "503", "429", "timeout", "timed out", "unavailable",
+        "high demand", "rate limit", "resource exhausted",
+        "temporary", "connection reset", "connection refused", "bad gateway"
+    ]
+    if any(kw in err_str for kw in retryable_keywords):
+        return True
+
+    return False
+
+
+def is_http_503_error(exc: Exception) -> bool:
+    """Backwards compatibility helper for existing 503 checks."""
+    if isinstance(exc, ServiceUnavailableError):
+        return True
+    if getattr(exc, "status_code", None) == 503:
+        return True
+    resp = getattr(exc, "response", None)
+    if resp and getattr(resp, "status_code", None) == 503:
+        return True
+    err_str = str(exc)
+    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+        return True
+    return False
 
 
 def parse_simulate_failure_header(header_val: Optional[str]) -> Dict[str, int]:
@@ -64,7 +137,6 @@ def calculate_tokens(model: str, messages: List[Dict[str, str]], reply_text: str
     try:
         input_tokens = litellm.token_counter(model=model, messages=messages)
     except Exception:
-        # Fallback estimation if model tokenizer unavailable
         total_chars = sum(len(m.get("content", "")) for m in messages)
         input_tokens = max(1, total_chars // 4)
 
@@ -78,7 +150,8 @@ def calculate_tokens(model: str, messages: List[Dict[str, str]], reply_text: str
 
 class LLMService:
     def __init__(self):
-        self.model = settings.LLM_MODEL
+        self.model = settings.normalized_model
+        self.timeout = settings.LLM_REQUEST_TIMEOUT
 
     def get_configured_keys_count(self) -> int:
         return len(settings.key_pool)
@@ -92,9 +165,10 @@ class LLMService:
         Executes chat completion with:
         1. Cache check (LiteLLM Cache)
         2. Automatic key pool failover (at least 2 keys)
-        3. X-Simulate-Failure test hook handling
-        4. Token tracking (input_tokens for this request, output_tokens for reply)
-        5. Accurate latency measurement
+        3. Real temporary errors (503, 429, timeout) exponential backoff retry with jitter per key
+        4. Immediate failover for non-retryable, permanent, or simulated errors (NO retry on X-Simulate-Failure)
+        5. Token tracking (input_tokens for this request, output_tokens for reply)
+        6. Accurate latency measurement
         """
         start_time = time.perf_counter()
         sim_map = {}
@@ -104,14 +178,12 @@ class LLMService:
         cache_key = litellm.cache.get_cache_key(model=self.model, messages=messages)
 
         # 1. Response Caching Check
-        # If no simulation requested, check LiteLLM Cache first
         if not sim_map:
             cached_entry = litellm.cache.get_cache(
                 model=self.model,
                 messages=messages,
                 cache={"use-cache": True}
             )
-            # If not found via high-level helper, check underlying store
             if cached_entry is None and hasattr(litellm.cache, "cache"):
                 raw = litellm.cache.cache.get_cache(cache_key)
                 if raw and isinstance(raw, dict) and "response" in raw:
@@ -119,7 +191,6 @@ class LLMService:
 
             if cached_entry:
                 latency_ms = int((time.perf_counter() - start_time) * 1000)
-                # Ensure minimum 1ms or realistic cache retrieval latency
                 latency_ms = max(1, latency_ms)
 
                 reply_text = cached_entry.get("reply", "")
@@ -141,6 +212,7 @@ class LLMService:
         # 2. Key Pool Iteration & Automatic Failover
         key_pool = settings.key_pool
         if not key_pool:
+            logger.error("No API keys found in configured key pool")
             raise HTTPException(status_code=503, detail="all providers unavailable")
 
         fallback_attempts = 0
@@ -158,83 +230,113 @@ class LLMService:
                 simulated_code = sim_map[key_id]
 
             if simulated_code is not None:
-                logger.info("Simulating failure on %s with status %s", key_id, simulated_code)
+                # Simulated failure: DO NOT RETRY. Immediately treat as failed and fail over!
+                logger.info("Simulating failure on %s with status %s (no retry)", key_id, simulated_code)
                 fallback_attempts += 1
                 last_error = f"Simulated error {simulated_code}"
                 continue
 
-            # Live call using LiteLLM
-            try:
-                # Direct call to LiteLLM completion
-                response = litellm.completion(
-                    model=self.model,
-                    messages=messages,
-                    api_key=actual_key,
-                    timeout=30.0
-                )
+            logger.info("Trying provider %s", key_id)
+            key_succeeded = False
 
-                # Extract reply text
-                reply_text = response.choices[0].message.content or ""
+            # Real provider call with bounded retries for temporary errors (503, 429, timeout)
+            for attempt in range(MAX_ATTEMPTS_PER_KEY):
+                try:
+                    call_kwargs = {
+                        "model": self.model,
+                        "messages": messages,
+                        "api_key": actual_key,
+                        "timeout": self.timeout,
+                    }
+                    if "gemini-3.8-flash" in self.model:
+                        call_kwargs["reasoning_effort"] = "low"
 
-                # Extract token usage
-                if hasattr(response, "usage") and response.usage:
-                    input_tokens = getattr(response.usage, "prompt_tokens", None)
-                    output_tokens = getattr(response.usage, "completion_tokens", None)
-                    if input_tokens is None or output_tokens is None:
-                        calc_in, calc_out = calculate_tokens(self.model, messages, reply_text)
-                        input_tokens = input_tokens if input_tokens is not None else calc_in
-                        output_tokens = output_tokens if output_tokens is not None else calc_out
-                else:
-                    input_tokens, output_tokens = calculate_tokens(self.model, messages, reply_text)
+                    # Run blocking litellm.completion off the asyncio event loop
+                    response = await asyncio.to_thread(litellm.completion, **call_kwargs)
 
-                latency_ms = int((time.perf_counter() - start_time) * 1000)
-                latency_ms = max(1, latency_ms)
+                    # Extract reply text
+                    reply_text = response.choices[0].message.content or ""
 
-                # Store into LiteLLM cache for future identical requests
-                cache_payload = {
-                    "reply": reply_text,
-                    "input_tokens": int(input_tokens),
-                    "output_tokens": int(output_tokens),
-                    "model": self.model
-                }
-                if hasattr(litellm.cache, "cache"):
-                    litellm.cache.cache.set_cache(
-                        cache_key,
-                        {"timestamp": time.time(), "response": cache_payload}
-                    )
+                    # Extract token usage
+                    if hasattr(response, "usage") and response.usage:
+                        input_tokens = getattr(response.usage, "prompt_tokens", None)
+                        output_tokens = getattr(response.usage, "completion_tokens", None)
+                        if input_tokens is None or output_tokens is None:
+                            calc_in, calc_out = calculate_tokens(self.model, messages, reply_text)
+                            input_tokens = input_tokens if input_tokens is not None else calc_in
+                            output_tokens = output_tokens if output_tokens is not None else calc_out
+                    else:
+                        input_tokens, output_tokens = calculate_tokens(self.model, messages, reply_text)
 
-                return {
-                    "reply": reply_text,
-                    "resolution_source": "LIVE_INFERENCE",
-                    "model": self.model,
-                    "latency_ms": latency_ms,
-                    "input_tokens": int(input_tokens),
-                    "output_tokens": int(output_tokens),
-                    "key_id": key_id,
-                    "fallback_attempts": fallback_attempts
-                }
+                    latency_ms = int((time.perf_counter() - start_time) * 1000)
+                    latency_ms = max(1, latency_ms)
 
-            except (RateLimitError, ServiceUnavailableError, InternalServerError, BadGatewayError, APIConnectionError, APIError) as e:
-                logger.warning("Provider error with %s: %s", key_id, str(e))
+                    # Store into LiteLLM cache for future identical requests
+                    cache_payload = {
+                        "reply": reply_text,
+                        "input_tokens": int(input_tokens),
+                        "output_tokens": int(output_tokens),
+                        "model": self.model
+                    }
+                    if hasattr(litellm.cache, "cache"):
+                        litellm.cache.cache.set_cache(
+                            cache_key,
+                            {"timestamp": time.time(), "response": cache_payload}
+                        )
+
+                    key_succeeded = True
+                    return {
+                        "reply": reply_text,
+                        "resolution_source": "LIVE_INFERENCE",
+                        "model": self.model,
+                        "latency_ms": latency_ms,
+                        "input_tokens": int(input_tokens),
+                        "output_tokens": int(output_tokens),
+                        "key_id": key_id,
+                        "fallback_attempts": fallback_attempts
+                    }
+
+                except Exception as e:
+                    last_error = str(e)
+
+                    # 1. Permanent error (401, 403, 404, invalid auth, bad request) -> fail over immediately
+                    if is_permanent_error(e):
+                        logger.warning(
+                            "Permanent provider error on %s: %s. Failing over immediately without retry.",
+                            key_id, str(e)
+                        )
+                        break
+
+                    # 2. Temporary retryable error (503 high demand, 429 rate limit, timeout, 502/504) -> retry with backoff + jitter
+                    if is_retryable_error(e):
+                        if attempt < len(BACKOFF_DELAYS):
+                            base_delay = BACKOFF_DELAYS[attempt]
+                            jitter = random.uniform(0.1, 0.4)
+                            delay = base_delay + jitter
+                            logger.warning(
+                                "Temporary provider error on %s (attempt %d/%d): %s. Retrying in %.2fs...",
+                                key_id, attempt + 1, MAX_ATTEMPTS_PER_KEY, str(e), delay
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            logger.warning(
+                                "Key %s exhausted all %d retry attempts for temporary error. Failing over to next key.",
+                                key_id, MAX_ATTEMPTS_PER_KEY
+                            )
+                            break
+                    else:
+                        # Non-retryable provider failure
+                        logger.warning(
+                            "Non-retryable provider error on %s: %s. Failing over immediately.",
+                            key_id, str(e)
+                        )
+                        break
+
+            if not key_succeeded:
                 fallback_attempts += 1
-                last_error = str(e)
-                continue
-            except Exception as e:
-                # Check status code attribute if present on exception
-                status_code = getattr(e, "status_code", None)
-                if status_code in (429, 500, 502, 503):
-                    logger.warning("HTTP status %s with %s", status_code, key_id)
-                    fallback_attempts += 1
-                    last_error = str(e)
-                    continue
-                else:
-                    # Treat unexpected provider call failure as fallback opportunity
-                    logger.warning("Error with %s: %s", key_id, str(e))
-                    fallback_attempts += 1
-                    last_error = str(e)
-                    continue
 
-        # If every key in the pool failed
+        # If every key in the pool failed after appropriate retries
         logger.error("All providers failed after %s fallback attempts. Last error: %s", fallback_attempts, last_error)
         raise HTTPException(status_code=503, detail="all providers unavailable")
 

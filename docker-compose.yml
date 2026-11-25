@@ -14,8 +14,9 @@ services:
       - DATABASE_URL=${DATABASE_URL:-sqlite:////data/app.db}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       - ENABLE_FAILURE_SIMULATION=${ENABLE_FAILURE_SIMULATION:-true}
-      - LLM_MODEL=${LLM_MODEL:-gemini/gemini-2.0-flash}
+      - LLM_MODEL=${LLM_MODEL:-gemini/gemini-3.8-flash}
       - CACHE_TYPE=${CACHE_TYPE:-local}
+      - LLM_REQUEST_TIMEOUT=${LLM_REQUEST_TIMEOUT:-20.0}
     volumes:
       - sqlite_data:/data
     healthcheck:

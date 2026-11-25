@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
     # Automatically initialize SQLite schema on startup
     init_db()
     logger.info("Database initialized. Ready to accept requests.")
+    logger.info("Loaded %d Gemini API keys", len(settings.key_pool))
     yield
 
 
