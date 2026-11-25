@@ -24,7 +24,7 @@ class Settings(BaseSettings):
         description="SQLite database URL"
     )
     ALLOWED_ORIGINS: str = Field(
-        default="http://localhost:3000,http://127.0.0.1:3000",
+        default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,https://lyftr-ai-full-stack-assignment.vercel.app",
         description="Comma-separated allowed CORS origins"
     )
     ENABLE_FAILURE_SIMULATION: bool = Field(
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
         description="Enable X-Simulate-Failure header"
     )
     LLM_MODEL: str = Field(
-        default="gemini/gemini-3.8-flash",
+        default="gemini/gemini-3.5-flash-lite",
         description="LiteLLM model name to use"
     )
     DEFAULT_SYSTEM_PROMPT: str = Field(

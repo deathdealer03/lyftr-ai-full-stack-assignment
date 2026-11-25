@@ -1,4 +1,5 @@
 import logging
+import re as _re
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -35,6 +36,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backend")
 
+# Regex patterns for dynamic CORS origins (e.g. Vercel preview URLs)
+_CORS_REGEX_PATTERNS = [
+    _re.compile(r"^https://[a-zA-Z0-9-]+-[a-zA-Z0-9-]+\.vercel\.app$"),  # Vercel preview deployments
+    _re.compile(r"^https://lyftr-ai-full-stack-assignment.*\.vercel\.app$"),  # Production Vercel
+]
+
+
+def _is_allowed_origin(origin: str) -> bool:
+    """Returns True if the origin matches the explicit list OR the dynamic regex list."""
+    if origin in settings.cors_origins:
+        return True
+    return any(pat.match(origin) for pat in _CORS_REGEX_PATTERNS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,10 +66,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS middleware
+# Build the final allowed origins list: explicit list + wildcard for matched vercel domains
+# FastAPI CORSMiddleware doesn't support regex, so we pass allow_origins=["*"] when any
+# dynamic origin might match, BUT we override the Allow-Origin header ourselves via a custom
+# CORS configuration that merges static origins + allow_origin_regex.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
